@@ -391,12 +391,26 @@ function createWorker(self) {
 	// XYZ - Scale (Float32)
 	// RGBA - colors (uint8)
 	// IJKL - quaternion/rot (uint8)
-	const rowLength = 3 * 4 + 3 * 4 + 4 + 4;
 	let lastProj = [];
 	let depthIndex = new Uint32Array();
+	let sphericalHarmonics;
+	
+	function getFloatRowLength() {
+	    return 3 + 3 + (sphericalHarmonics ? (3 * sphericalHarmonics.nPerChannel) : 0);
+	}
+	
+	function getRowLength() {
+        return getFloatRowLength() * 4 + 4 + 4;
+	}
 
 	const runSort = (viewProj) => {
 		if (!buffer) return;
+		
+		const fBufStride = getFloatRowLength() + 2;
+		const uBufStride = fBufStride * 4;
+		const uBufOffset = getFloatRowLength() * 4;
+		
+		// console.log({sphericalHarmonics,fBufStride,uBufStride,uBufOffset});
 
 		const f_buffer = new Float32Array(buffer);
 		const u_buffer = new Uint8Array(buffer);
@@ -406,6 +420,13 @@ function createWorker(self) {
 
 		const center = new Float32Array(3 * vertexCount);
 		const color = new Float32Array(4 * vertexCount);
+		
+		let shBuffers;
+		
+		if (sphericalHarmonics) {
+		    const nHarmonicsAsVec4 = (3 * sphericalHarmonics.nPerChannel) / 4;
+		    shBuffers = Array.from({ length: nHarmonicsAsVec4 }, (_, i) => new Float32Array(4 * vertexCount));
+		}
 
 		if (depthIndex.length == vertexCount) {
 			let dot =
@@ -422,9 +443,9 @@ function createWorker(self) {
 		let sizeList = new Int32Array(vertexCount);
 		for (let i = 0; i < vertexCount; i++) {
 			let depth =
-				((viewProj[2] * f_buffer[8 * i + 0] +
-					viewProj[6] * f_buffer[8 * i + 1] +
-					viewProj[10] * f_buffer[8 * i + 2]) *
+				((viewProj[2] * f_buffer[fBufStride * i + 0] +
+					viewProj[6] * f_buffer[fBufStride * i + 1] +
+					viewProj[10] * f_buffer[fBufStride * i + 2]) *
 					4096) |
 				0;
 			sizeList[i] = depth;
@@ -451,26 +472,34 @@ function createWorker(self) {
 		for (let j = 0; j < vertexCount; j++) {
 			const i = depthIndex[j];
 
-			center[3 * j + 0] = f_buffer[8 * i + 0];
-			center[3 * j + 1] = f_buffer[8 * i + 1];
-			center[3 * j + 2] = f_buffer[8 * i + 2];
+			center[3 * j + 0] = f_buffer[fBufStride * i + 0];
+			center[3 * j + 1] = f_buffer[fBufStride * i + 1];
+			center[3 * j + 2] = f_buffer[fBufStride * i + 2];
 
-			color[4 * j + 0] = u_buffer[32 * i + 24 + 0] / 255;
-			color[4 * j + 1] = u_buffer[32 * i + 24 + 1] / 255;
-			color[4 * j + 2] = u_buffer[32 * i + 24 + 2] / 255;
-			color[4 * j + 3] = u_buffer[32 * i + 24 + 3] / 255;
+			color[4 * j + 0] = u_buffer[uBufStride * i + uBufOffset + 0] / 255;
+			color[4 * j + 1] = u_buffer[uBufStride * i + uBufOffset + 1] / 255;
+			color[4 * j + 2] = u_buffer[uBufStride * i + uBufOffset + 2] / 255;
+			color[4 * j + 3] = u_buffer[uBufStride * i + uBufOffset + 3] / 255;
 
 			let scale = [
-				f_buffer[8 * i + 3 + 0],
-				f_buffer[8 * i + 3 + 1],
-				f_buffer[8 * i + 3 + 2],
-			].map(x => x);
-			let rot = [
-				(u_buffer[32 * i + 28 + 0] - 128) / 128,
-				(u_buffer[32 * i + 28 + 1] - 128) / 128,
-				(u_buffer[32 * i + 28 + 2] - 128) / 128,
-				(u_buffer[32 * i + 28 + 3] - 128) / 128,
+				f_buffer[fBufStride * i + 3 + 0],
+				f_buffer[fBufStride * i + 3 + 1],
+				f_buffer[fBufStride * i + 3 + 2],
 			];
+			let rot = [
+				(u_buffer[uBufStride * i + uBufOffset + 4 + 0] - 128) / 128,
+				(u_buffer[uBufStride * i + uBufOffset + 4 + 1] - 128) / 128,
+				(u_buffer[uBufStride * i + uBufOffset + 4 + 2] - 128) / 128,
+				(u_buffer[uBufStride * i + uBufOffset + 4 + 3] - 128) / 128,
+			];
+			
+			if (shBuffers) {
+			    for (let jj = 0; jj < shBuffers.length; ++jj) {
+			        for (let kk = 0; kk < 4; ++kk) {
+			            shBuffers[jj][4 * j + kk] = f_buffer[fBufStride * i + 6 + jj*4 + kk];
+			        }
+			    }
+			}
 
 			const R = [
 				1.0 - 2.0 * (rot[2] * rot[2] + rot[3] * rot[3]),
@@ -485,8 +514,17 @@ function createWorker(self) {
 				2.0 * (rot[2] * rot[3] - rot[0] * rot[1]),
 				1.0 - 2.0 * (rot[1] * rot[1] + rot[2] * rot[2]),
 			];
-
+			
+			const MAX_SCALE = 10000;
 			// Compute the matrix product of S and R (M = S * R)
+			if (scale[0]*scale[0] + scale[1]*scale[1] + scale[2]*scale[2] > MAX_SCALE*MAX_SCALE) {
+			    throw "Invalid scale, the data is probably corrupted";
+			}
+			
+			/*const CAP_SCALE = 0.001;
+			for (let iii = 0; iii < 3; ++iii)
+			    scale[iii] = Math.min(scale[iii], CAP_SCALE);*/
+			
 			const M = [
 				scale[0] * R[0],
 				scale[0] * R[1],
@@ -506,18 +544,30 @@ function createWorker(self) {
 			covB[3 * j + 1] = M[1] * M[2] + M[4] * M[5] + M[7] * M[8];
 			covB[3 * j + 2] = M[2] * M[2] + M[5] * M[5] + M[8] * M[8];
 		}
-
-		self.postMessage({ covA, center, color, covB, viewProj }, [
+		
+		let objs = { covA, center, color, covB, viewProj };
+		let bufs = [
 			covA.buffer,
 			center.buffer,
 			color.buffer,
-			covB.buffer,
-		]);
+			covB.buffer
+		];
+		if (shBuffers) {
+		    for (let jj = 0; jj < shBuffers.length; ++jj) {
+		        objs[`sh${jj}`] = shBuffers[jj];
+		        bufs.push(shBuffers[jj].buffer);
+		    }
+		}
+
+		self.postMessage(objs, bufs);
 
 		// console.timeEnd("sort");
 	};
 
 	function processPlyBuffer(inputBuffer) {
+        const floatRowLength = getFloatRowLength();
+        const rowLength = getRowLength();
+	
 		const ubuf = new Uint8Array(inputBuffer);
 		// 10KB ought to be enough for a header...
 		const header = new TextDecoder().decode(ubuf.slice(0, 1024 * 10));
@@ -593,7 +643,6 @@ function createWorker(self) {
 		// XYZ - Scale (Float32)
 		// RGBA - colors (uint8)
 		// IJKL - quaternion/rot (uint8)
-		const rowLength = 3 * 4 + 3 * 4 + 4 + 4;
 		const buffer = new ArrayBuffer(rowLength * vertexCount);
 
 		console.time("build buffer");
@@ -604,12 +653,12 @@ function createWorker(self) {
 			const scales = new Float32Array(buffer, j * rowLength + 4 * 3, 3);
 			const rgba = new Uint8ClampedArray(
 				buffer,
-				j * rowLength + 4 * 3 + 4 * 3,
+				j * rowLength + floatRowLength,
 				4,
 			);
 			const rot = new Uint8ClampedArray(
 				buffer,
-				j * rowLength + 4 * 3 + 4 * 3 + 4,
+				j * rowLength + floatRowLength + 4,
 				4,
 			);
 
@@ -684,11 +733,12 @@ function createWorker(self) {
 			vertexCount = 0;
 			runSort(viewProj);
 			buffer = processPlyBuffer(e.data.ply);
-			vertexCount = Math.floor(buffer.byteLength / rowLength);
+			vertexCount = Math.floor(buffer.byteLength / getRowLength());
 			postMessage({ buffer: buffer });
 		} else if (e.data.buffer) {
 			buffer = e.data.buffer;
 			vertexCount = e.data.vertexCount;
+			sphericalHarmonics = e.data.sphericalHarmonics.keep ? e.data.sphericalHarmonics : null;
 		} else if (e.data.vertexCount) {
 			vertexCount = e.data.vertexCount;
 		} else if (e.data.view) {
@@ -817,9 +867,12 @@ async function main() {
 	if (req.status != 200)
 		throw new Error(req.status + " Unable to load " + req.url);
 
-	const rowLength = 3 * 4 + 3 * 4 + 4 + 4;
 	const reader = req.body.getReader();
 	let splatData = new Uint8Array(req.headers.get("content-length"));
+	
+	const N_HARMONICS_PER_CHANNEL = 16;
+	const sphericalHarmonics = { keep: !!params.get('sh'), nPerChannel: N_HARMONICS_PER_CHANNEL };
+	const rowLength = (3 + 3 + (sphericalHarmonics.keep ? (3 * sphericalHarmonics.nPerChannel) : 0)) * 4 + 4 + 4;
 
 	const downsample =
 		splatData.length / rowLength > 500000 ? 1 : 1 / devicePixelRatio;
@@ -971,7 +1024,7 @@ async function main() {
 			document.body.appendChild(link);
 			link.click();
 		} else {
-			let { covA, covB, center, color, viewProj } = e.data;
+			let { covA, covB, center, color, viewProj, ...shBuffers } = e.data;
 			lastData = e.data;
 
 			activeDownsample = downsample
@@ -1267,6 +1320,7 @@ async function main() {
 					worker.postMessage({
 						buffer: splatData.buffer,
 						vertexCount: Math.floor(splatData.length / rowLength),
+						sphericalHarmonics
 					});
 				}
 			};
@@ -1315,6 +1369,7 @@ async function main() {
 			worker.postMessage({
 				buffer: splatData.buffer,
 				vertexCount: Math.floor(bytesRead / rowLength),
+				sphericalHarmonics
 			});
 			lastVertexCount = vertexCount;
 		}
@@ -1323,6 +1378,7 @@ async function main() {
 		worker.postMessage({
 			buffer: splatData.buffer,
 			vertexCount: Math.floor(bytesRead / rowLength),
+			sphericalHarmonics
 		});
 }
 
